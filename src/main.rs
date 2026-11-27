@@ -2,10 +2,43 @@ fn main() {
     println!("Hello, world!");
 }
 
-use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use sync::{Arc, AtomicUsize, Ordering, UnsafeCell};
+
+/// Under `RUSTFLAGS="--cfg loom"` every shared-memory primitive comes from loom,
+/// which then sees each slot access and atomic and can explore all interleavings.
+#[cfg(loom)]
+mod sync {
+    pub use loom::cell::UnsafeCell;
+    pub use loom::sync::Arc;
+    pub use loom::sync::atomic::{AtomicUsize, Ordering};
+}
+
+#[cfg(not(loom))]
+mod sync {
+    pub use std::sync::Arc;
+    pub use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// std's UnsafeCell behind loom's closure API, so the ring is written once
+    /// for both. Inlines to a plain pointer access.
+    pub struct UnsafeCell<T>(std::cell::UnsafeCell<T>);
+
+    impl<T> UnsafeCell<T> {
+        pub const fn new(v: T) -> Self {
+            Self(std::cell::UnsafeCell::new(v))
+        }
+
+        #[inline(always)]
+        pub fn with<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
+            f(self.0.get())
+        }
+
+        #[inline(always)]
+        pub fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
+            f(self.0.get())
+        }
+    }
+}
 
 /// head and tail on separate cache lines: no false sharing between cores.
 #[repr(align(64))]
@@ -25,16 +58,23 @@ struct Ring<T, const N: usize> {
 unsafe impl<T: Send, const N: usize> Sync for Ring<T, N> {}
 
 impl<T, const N: usize> Ring<T, N> {
-    const MASK: usize = N - 1; // N is a power of two, so i & MASK == i % N
+    // N is a power of two, so i & MASK == i % N, and slot indices stay
+    // consistent when the free-running head/tail counters wrap at usize::MAX.
+    const MASK: usize = N - 1;
 }
 
 impl<T, const N: usize> Drop for Ring<T, N> {
     fn drop(&mut self) {
-        let (mut h, t) = (*self.head.0.get_mut(), *self.tail.0.get_mut());
+        // &mut self: no other thread can touch the ring, so Relaxed is enough
+        // (loom has no get_mut on atomics, and this is the same instruction).
+        let (mut h, t) = (
+            self.head.0.load(Ordering::Relaxed),
+            self.tail.0.load(Ordering::Relaxed),
+        );
         while h != t {
             // SAFETY: &mut self means no Producer/Consumer is alive, and slots in
             // [head, tail) were initialized by push and not yet moved out by pop.
-            unsafe { self.slots[h & Self::MASK].get_mut().assume_init_drop() };
+            self.slots[h & Self::MASK].with_mut(|s| unsafe { (*s).assume_init_drop() });
             h = h.wrapping_add(1);
         }
     }
@@ -69,7 +109,7 @@ impl<T, const N: usize> Producer<T, N> {
         // the slot. Producer is not Clone and push takes &mut self, so we are the
         // only writer. The slot holds no live value (never written, or already
         // moved out by pop), so overwriting without dropping leaks nothing.
-        unsafe { (*r.slots[tail & Ring::<T, N>::MASK].get()).write(v) };
+        r.slots[tail & Ring::<T, N>::MASK].with_mut(|s| unsafe { (*s).write(v) });
         r.tail.0.store(tail.wrapping_add(1), Ordering::Release); // publish
         Ok(())
     }
@@ -87,13 +127,13 @@ impl<T, const N: usize> Consumer<T, N> {
         // initialized it and will not touch it until we publish the new head
         // below. The Acquire on tail makes that write visible. Consumer is not
         // Clone and pop takes &mut self, so this value is read out exactly once.
-        let v = unsafe { (*r.slots[head & Ring::<T, N>::MASK].get()).assume_init_read() };
+        let v = r.slots[head & Ring::<T, N>::MASK].with(|s| unsafe { (*s).assume_init_read() });
         r.head.0.store(head.wrapping_add(1), Ordering::Release); // free the slot
         Some(v)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
@@ -269,7 +309,11 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let (mut p, mut c) = channel::<Counted, 8>();
         for id in 0..6 {
-            p.push(Counted { id, drops: drops.clone() }).unwrap();
+            p.push(Counted {
+                id,
+                drops: drops.clone(),
+            })
+            .unwrap();
         }
         assert_eq!(c.pop().unwrap().id, 0);
         assert_eq!(c.pop().unwrap().id, 1);
@@ -289,7 +333,11 @@ mod tests {
             if id >= 2 {
                 drop(c.pop().unwrap());
             }
-            p.push(Counted { id, drops: drops.clone() }).unwrap();
+            p.push(Counted {
+                id,
+                drops: drops.clone(),
+            })
+            .unwrap();
         }
         assert_eq!(drops.load(Ordering::Relaxed), 4);
         assert_eq!(c.0.head.0.load(Ordering::Relaxed) & 3, 3);
@@ -305,7 +353,11 @@ mod tests {
         // Producer gone: consumer still drains what was pushed.
         let (mut p, mut c) = channel::<Counted, 4>();
         for id in 0..3 {
-            p.push(Counted { id, drops: drops.clone() }).unwrap();
+            p.push(Counted {
+                id,
+                drops: drops.clone(),
+            })
+            .unwrap();
         }
         drop(p);
         for id in 0..3 {
@@ -319,9 +371,19 @@ mod tests {
         let (mut p, c) = channel::<Counted, 4>();
         drop(c);
         for id in 0..4 {
-            p.push(Counted { id, drops: drops.clone() }).unwrap();
+            p.push(Counted {
+                id,
+                drops: drops.clone(),
+            })
+            .unwrap();
         }
-        assert!(p.push(Counted { id: 4, drops: drops.clone() }).is_err()); // dropped here
+        assert!(
+            p.push(Counted {
+                id: 4,
+                drops: drops.clone()
+            })
+            .is_err()
+        ); // dropped here
         assert_eq!(drops.load(Ordering::Relaxed), 4);
         drop(p);
         assert_eq!(drops.load(Ordering::Relaxed), 8);
@@ -343,7 +405,10 @@ mod tests {
             if xorshift(&mut rng) % 4 < push_odds {
                 let id = created;
                 created += 1;
-                match p.push(Counted { id, drops: drops.clone() }) {
+                match p.push(Counted {
+                    id,
+                    drops: drops.clone(),
+                }) {
                     Ok(()) => {
                         assert!(model.len() < N, "push succeeded on a full ring");
                         model.push_back(id);
@@ -452,7 +517,13 @@ mod tests {
         let d = drops.clone();
         let mut producer = Some(thread::spawn(move || {
             for id in 0..ITEMS {
-                push_spin(&mut p, Counted { id, drops: d.clone() });
+                push_spin(
+                    &mut p,
+                    Counted {
+                        id,
+                        drops: d.clone(),
+                    },
+                );
             }
         }));
         for id in 0..ITEMS - N {
@@ -487,5 +558,191 @@ mod tests {
         assert_send::<Consumer<String, 4>>();
         // Not Clone, so there is exactly one of each; checked by the absence of
         // a Clone impl (a compile-fail test would need trybuild).
+    }
+}
+
+/// Exhaustive interleaving checks. Run with:
+/// `RUSTFLAGS="--cfg loom" cargo test --release loom`
+/// Loom runs each closure under every legal thread schedule (and every value
+/// the C11 memory model lets a load return), failing on any data race on a
+/// slot, any leak, or any failed assertion.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use loom::thread;
+
+    fn push_spin<T, const N: usize>(p: &mut Producer<T, N>, mut v: T) {
+        while let Err(back) = p.push(v) {
+            v = back;
+            thread::yield_now(); // tells loom to switch threads, bounding the search
+        }
+    }
+
+    fn pop_spin<T, const N: usize>(c: &mut Consumer<T, N>) -> T {
+        loop {
+            if let Some(v) = c.pop() {
+                return v;
+            }
+            thread::yield_now();
+        }
+    }
+
+    /// Producer sends `items` in order on a ring of capacity N; consumer checks order.
+    fn stream<const N: usize>(items: usize) {
+        loom::model(move || {
+            let (mut p, mut c) = channel::<Box<usize>, N>();
+            let producer = thread::spawn(move || {
+                for i in 0..items {
+                    push_spin(&mut p, Box::new(i));
+                }
+            });
+            for i in 0..items {
+                assert_eq!(*pop_spin(&mut c), i);
+            }
+            producer.join().unwrap();
+            assert!(c.pop().is_none());
+        });
+    }
+
+    #[test]
+    fn loom_publish_one_value() {
+        // Producer's write of the slot vs consumer's read: tail Release/Acquire.
+        stream::<1>(1);
+    }
+
+    #[test]
+    fn loom_slot_reuse_capacity_1() {
+        // Every push after the first reuses the slot the consumer just read:
+        // head Release/Acquire must order that read before the overwrite.
+        stream::<1>(3);
+    }
+
+    #[test]
+    fn loom_slot_reuse_capacity_2() {
+        // Ring wraps once; producer can run up to 2 ahead of the consumer.
+        stream::<2>(4);
+    }
+
+    #[test]
+    fn loom_full_ring_returns_value() {
+        loom::model(|| {
+            let (mut p, mut c) = channel::<usize, 1>();
+            let producer = thread::spawn(move || {
+                // Racing with the consumer: either the ring is still full and the
+                // value comes back, or the slot was freed and it went in.
+                p.push(0).unwrap();
+                match p.push(1) {
+                    Ok(()) => true,
+                    Err(v) => {
+                        assert_eq!(v, 1);
+                        false
+                    }
+                }
+            });
+            assert_eq!(pop_spin(&mut c), 0);
+            let second_went_in = producer.join().unwrap();
+            assert_eq!(c.pop(), second_went_in.then_some(1));
+        });
+    }
+
+    #[test]
+    fn loom_drop_with_items_in_flight() {
+        // Consumer quits after one item while the producer may still be pushing;
+        // whichever handle drops last frees the rest. Loom's Arc reports a leak
+        // if any value is never dropped, and the slot cells flag a double drop.
+        loom::model(|| {
+            let (mut p, mut c) = channel::<Arc<()>, 2>();
+            let witness = Arc::new(());
+            let w = witness.clone();
+            let producer = thread::spawn(move || {
+                for _ in 0..3 {
+                    push_spin(&mut p, w.clone());
+                }
+            });
+            drop(pop_spin(&mut c));
+            drop(c);
+            producer.join().unwrap();
+            assert_eq!(Arc::strong_count(&witness), 1, "every queued clone dropped");
+        });
+    }
+
+    #[test]
+    fn loom_counters_wrap_usize() {
+        // Same handoff as slot_reuse, but head/tail cross usize::MAX mid-stream.
+        loom::model(|| {
+            let ring = Arc::new(Ring::<usize, 2> {
+                head: CachePadded(AtomicUsize::new(usize::MAX - 1)),
+                tail: CachePadded(AtomicUsize::new(usize::MAX - 1)),
+                slots: std::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
+            });
+            let (mut p, mut c) = (Producer(ring.clone()), Consumer(ring));
+            let producer = thread::spawn(move || {
+                for i in 0..4 {
+                    push_spin(&mut p, i);
+                }
+            });
+            for i in 0..4 {
+                assert_eq!(pop_spin(&mut c), i);
+            }
+            producer.join().unwrap();
+        });
+    }
+}
+
+/// Throughput numbers, not correctness: `cargo test --release -- --ignored --nocapture bench`
+#[cfg(all(test, not(loom)))]
+mod bench {
+    use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn bench_uncontended() {
+        // One thread, push then pop: isolates per-op instruction cost.
+        const OPS: u64 = 200_000_000;
+        let (mut p, mut c) = channel::<u64, 1024>();
+        let t = Instant::now();
+        let mut sum = 0u64;
+        for i in 0..OPS {
+            p.push(black_box(i)).unwrap();
+            sum = sum.wrapping_add(c.pop().unwrap());
+        }
+        let ns = t.elapsed().as_nanos() as f64 / OPS as f64;
+        black_box(sum);
+        println!("BENCH uncontended_push_pop_ns {ns:.3}");
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_spsc() {
+        // Two threads streaming u64s: cross-core handoff cost.
+        const ITEMS: u64 = 50_000_000;
+        let (mut p, mut c) = channel::<u64, 1024>();
+        let t = Instant::now();
+        let producer = std::thread::spawn(move || {
+            for i in 0..ITEMS {
+                let mut v = i;
+                while let Err(back) = p.push(v) {
+                    v = back;
+                    std::hint::spin_loop();
+                }
+            }
+        });
+        let mut sum = 0u64;
+        let mut got = 0;
+        while got < ITEMS {
+            match c.pop() {
+                Some(v) => {
+                    sum = sum.wrapping_add(v);
+                    got += 1;
+                }
+                None => std::hint::spin_loop(),
+            }
+        }
+        producer.join().unwrap();
+        assert_eq!(sum, ITEMS * (ITEMS - 1) / 2);
+        let ns = t.elapsed().as_nanos() as f64 / ITEMS as f64;
+        println!("BENCH spsc_stream_ns_per_item {ns:.3}");
     }
 }
